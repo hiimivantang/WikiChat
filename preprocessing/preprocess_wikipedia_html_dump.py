@@ -14,7 +14,8 @@ from markdownify import MarkdownConverter
 from mwparserfromhtml.parse.plaintext import html_to_plaintext
 import orjsonl
 from tqdm import tqdm
-
+import json
+import pdb
 
 from preprocessing.block import Block
 
@@ -540,6 +541,7 @@ def prepend_dls(html_soup):
 def process_articles(
     input_queue,
     output_queue,
+    dead_letter_queue,
     pack_to_tokens: int,
     language: str,
     should_translate: bool,
@@ -548,85 +550,88 @@ def process_articles(
         article = input_queue.get()
         if article is None:
             break
+        try:
+            pdb.set_trace()
+            article_blocks = []
+            html = article["article_body"]["html"]
+            article_title = article["name"]
 
-        article_blocks = []
-        html = article["article_body"]["html"]
-        article_title = article["name"]
-
-        if should_translate:
-            # add English translation to title
-            article_title = get_entity_translation_to_english(
-                language, article_title, context=article_title
-            )  # don't add the translation if the article_title already has or is in English
-
-        html_soup = BeautifulSoup(html, features="lxml")
-
-        # Remove all citations and style tags
-        for tag in html_soup.select("sup.reference, style"):
-            tag.decompose()
-
-        # Display math equations better
-        for tag in html_soup.find_all(
-            "math", alttext=lambda value: value and value.startswith("{\displaystyle")
-        ):
-            tag.replace_with(
-                NavigableString(tag["alttext"][len("{\displaystyle") : -1])
-            )
-        preprocess_links(
-            html_soup,
-            article_title,
-            should_translate=should_translate,
-            language=language,
-        )
-
-        # <dl> right after <table>
-        tables1, dls1 = get_adjacent_tags(
-            html_soup, tag_that_comes_first="table", tag_that_comes_second="dl"
-        )
-        # <table> right after <dl>
-        dls2, tables2 = get_adjacent_tags(
-            html_soup, tag_that_comes_first="dl", tag_that_comes_second="table"
-        )
-        article_blocks.extend(
-            get_tables_and_infoboxes(html_soup, article_title, tables1 + tables2)
-        )
-
-        # sidebars are already processed together with tables
-        # https://en.wikipedia.org/wiki/Template:Sidebar
-        # https://en.wikipedia.org/wiki/Template:Clade
-        for t in html_soup.select(
-            "table.sidebar, table.clade, figure, .shortdescription"
-        ):
-            t.decompose()
-        # <dl> tags before or after tables are already indcluded with the table, so remove them here
-        for dl in dls1 + dls2:
-            dl.decompose()
-
-        prepend_dls(html_soup)
-
-        article_blocks.extend(
-            get_passages(
-                html_soup=html_soup,
-                article_title=article_title,
-                pack_to_tokens=pack_to_tokens,
-            )
-        )
-
-        for block in article_blocks:
-            if len(block.content_string) < 3:
-                continue  # skip empty blocks
-
-            if block.num_tokens == 0:
-                block.num_tokens = num_tokens(
-                    block.full_section_title + " " + block.content_string
-                )
-            block.article_title = article_title
-            block.language = language
-            block.last_edit_date = article["date_modified"]
             if should_translate:
-                block.deduplicate_translations()
+                # add English translation to title
+                article_title = get_entity_translation_to_english(
+                    language, article_title, context=article_title
+                )  # don't add the translation if the article_title already has or is in English
 
-            output_queue.put(block)
+            html_soup = BeautifulSoup(html, features="lxml")
+
+            # Remove all citations and style tags
+            for tag in html_soup.select("sup.reference, style"):
+                tag.decompose()
+
+            # Display math equations better
+            for tag in html_soup.find_all(
+                "math", alttext=lambda value: value and value.startswith("{\displaystyle")
+            ):
+                tag.replace_with(
+                    NavigableString(tag["alttext"][len("{\displaystyle") : -1])
+                )
+            preprocess_links(
+                html_soup,
+                article_title,
+                should_translate=should_translate,
+                language=language,
+            )
+
+            # <dl> right after <table>
+            tables1, dls1 = get_adjacent_tags(
+                html_soup, tag_that_comes_first="table", tag_that_comes_second="dl"
+            )
+            # <table> right after <dl>
+            dls2, tables2 = get_adjacent_tags(
+                html_soup, tag_that_comes_first="dl", tag_that_comes_second="table"
+            )
+            article_blocks.extend(
+                get_tables_and_infoboxes(html_soup, article_title, tables1 + tables2)
+            )
+
+            # sidebars are already processed together with tables
+            # https://en.wikipedia.org/wiki/Template:Sidebar
+            # https://en.wikipedia.org/wiki/Template:Clade
+            for t in html_soup.select(
+                "table.sidebar, table.clade, figure, .shortdescription"
+            ):
+                t.decompose()
+            # <dl> tags before or after tables are already indcluded with the table, so remove them here
+            for dl in dls1 + dls2:
+                dl.decompose()
+
+            prepend_dls(html_soup)
+
+            article_blocks.extend(
+                get_passages(
+                    html_soup=html_soup,
+                    article_title=article_title,
+                    pack_to_tokens=pack_to_tokens,
+                )
+            )
+
+            for block in article_blocks:
+                if len(block.content_string) < 3:
+                    continue  # skip empty blocks
+
+                if block.num_tokens == 0:
+                    block.num_tokens = num_tokens(
+                        block.full_section_title + " " + block.content_string
+                    )
+                block.article_title = article_title
+                block.language = language
+                block.last_edit_date = article["date_modified"]
+                if should_translate:
+                    block.deduplicate_translations()
+
+                output_queue.put(block)
+        except KeyError:
+            dead_letter_queue.put(article)
 
     output_queue.put(None)  # signal the end
 
@@ -814,6 +819,7 @@ if __name__ == "__main__":
 
     input_queue = SimpleQueue()
     output_queue = SimpleQueue()
+    dead_letter_queue = SimpleQueue()
     all_worker_processes = []
 
     for worker_id in range(args.num_workers):
@@ -823,6 +829,7 @@ if __name__ == "__main__":
                 args=(
                     input_queue,
                     output_queue,
+                    dead_letter_queue,
                     args.pack_to_tokens,
                     args.language,
                     args.should_translate,
@@ -878,6 +885,19 @@ if __name__ == "__main__":
         
     logger.info("Saving the collection to %s", args.output_path)
     orjsonl.save(args.output_path, all_blocks)
+
+    logger.info("pdb.set_trace() - DLQ")
+    pdb.set_trace()
+    with open(
+        os.path.join(os.path.dirname(args.output_path), "dead_letter_queue.jsonl"), "w"
+    ) as f:
+        while not dead_letter_queue.empty():
+            dlq_article = dead_letter_queue.get()
+            if dlq_article is None:
+                break
+            else:
+                f.write(json.dumps(dlq_article) + "\n")
+    
 
     # save the collection size
     with open(
