@@ -42,15 +42,21 @@ from preprocessing.wikipedia_disambiguation import is_disambiguation
 logger = get_logger(__name__)
 from transformers.utils import logging as transformers_logging
 
+# Reduce logging verbosity
 transformers_logging.set_verbosity(transformers_logging.ERROR)
+import logging
+# Set debug logging level - change to logging.INFO to reduce verbosity
+logger.setLevel(logging.INFO)
 
 # Constants for redirection map and processing
 REDIRECTION_MAP_FILE = "redirection_map.pkl"
 QUEUE_TIMEOUT = 300  # 5 minutes timeout for queue operations
 WORKER_TIMEOUT = 600  # 10 minutes timeout for worker processes
 BATCH_SIZE = 10000    # Number of blocks to save in each batch
-DEFAULT_QUEUE_SIZE = 5000  # Default size for bounded queues
-DEFAULT_WORKER_COUNT = 18  # Default number of worker processes for a high-core system
+DEFAULT_QUEUE_SIZE = 30000  # Increased queue size for better buffering
+DEFAULT_WORKER_COUNT = 22   # Increased default worker count for 24-core systems
+DEFAULT_OUTPUT_QUEUE_COUNT = 4  # Number of output queues to distribute load
+DEFAULT_PREFETCH_SIZE = 200  # Number of articles to prefetch
 
 inverse_redirection_map = (
     {}
@@ -651,14 +657,34 @@ def prepend_dls(html_soup):
 
 def process_articles(
     input_queue,
-    output_queue,
+    output_queues,
     dead_letter_queue,
     pack_to_tokens: int,
     language: str,
     should_translate: bool,
     worker_id: int,
 ):
-    """Process articles from the input queue with improved error handling and timeouts."""
+    """Process articles from the input queue with improved error handling and timeouts.
+    
+    Args:
+        input_queue: Queue to get articles from
+        output_queues: List of queues to distribute blocks to
+        dead_letter_queue: Queue for failed articles
+        pack_to_tokens: Maximum tokens per block
+        language: Language code
+        should_translate: Whether to translate entities
+        worker_id: Worker ID for logging and queue selection
+    """
+    # Select which output queue to use based on worker_id for better distribution
+    output_queue_idx = worker_id % len(output_queues)
+    output_queue = output_queues[output_queue_idx]
+    
+    # Update log with assigned queue
+    logger.info(f"Worker {worker_id} assigned to output queue {output_queue_idx}")
+    
+    # Track worker statistics
+    processed_articles = 0
+    processed_blocks = 0
     # Set up a timeout handler
     def timeout_handler(signum, frame):
         logger.warning(f"Worker {worker_id} timed out while processing an article")
@@ -684,6 +710,9 @@ def process_articles(
             
             article_blocks = []
             try:
+                # Track articles processed
+                processed_articles += 1
+                
                 html = article["article_body"]["html"]
                 article_title = article["name"]
 
@@ -770,8 +799,9 @@ def process_articles(
                 # Use a timeout for putting into the output queue
                 try:
                     output_queue.put(block, timeout=QUEUE_TIMEOUT)
+                    processed_blocks += 1  # Track successful block processing
                 except queue.Full:
-                    logger.warning(f"Worker {worker_id} timed out putting block in output queue: queue full")
+                    logger.warning(f"Worker {worker_id} timed out putting block in output queue {output_queue_idx}: queue full")
                     # If we can't put in the output queue, we'll add to dead letter queue
                     try:
                         dead_letter_queue.put(article, timeout=QUEUE_TIMEOUT)
@@ -794,12 +824,13 @@ def process_articles(
             except queue.Full:
                 logger.error(f"Worker {worker_id} couldn't add to dead letter queue after error: queue full")
     
-    # Signal completion
+    # Signal completion and log performance stats
     try:
-        output_queue.put(None, timeout=QUEUE_TIMEOUT)  # signal the end
-        logger.info(f"Worker {worker_id} finished and sent termination signal")
+        output_queue.put(None, timeout=QUEUE_TIMEOUT)  # signal the end for this queue
+        logger.info(f"Worker {worker_id} finished. Processed {processed_articles} articles " +
+                   f"producing {processed_blocks} blocks (avg {processed_blocks/max(1, processed_articles):.1f} blocks/article)")
     except queue.Full:
-        logger.error(f"Worker {worker_id} couldn't send termination signal: queue full")
+        logger.error(f"Worker {worker_id} couldn't send termination signal to queue {output_queue_idx}: queue full")
 
 
 def url_to_entity_name(url):
@@ -913,14 +944,90 @@ def estimate_article_complexity(article):
         return 500000
 
 
+def prefetch_articles_process(
+    file_path: str,
+    prefetch_queue: Queue,
+    redirect_map: dict,
+    max_articles: int,
+    prefetch_size: int,
+):
+    """
+    Dedicated prefetch process that reads articles ahead of time and preprocesses them.
+    This helps to optimize I/O by ensuring we're always reading from disk even when workers are busy.
+    
+    Args:
+        file_path: Path to the Wikipedia dump file
+        prefetch_queue: Queue to add prefetched articles to
+        redirect_map: Map of article redirections
+        max_articles: Maximum number of articles to process
+        prefetch_size: Number of articles to prefetch
+    """
+    try:
+        counter = 0
+        for article in tarfile_loader(file_path):
+            try:
+                # Basic filtering - same as in articles_without_disambiguation_or_redirections
+                if is_disambiguation(article):
+                    continue
+                url = url_to_entity_name(article["url"])
+                if url not in redirect_map:
+                    continue
+                
+                # Add basic metadata - pre-calculate complexity
+                article['_complexity'] = estimate_article_complexity(article)
+                article['_id'] = url
+                
+                # Try to put in queue
+                try:
+                    prefetch_queue.put(article, timeout=QUEUE_TIMEOUT)
+                    counter += 1
+                    
+                    # Check if we've reached the limit
+                    if max_articles > 0 and counter >= max_articles:
+                        break
+                        
+                    # qsize() is not reliable on all platforms, so wrap it in a try-except
+                    try:
+                        if prefetch_queue.qsize() > prefetch_size * 1.5:
+                            time.sleep(1)
+                    except Exception:
+                        # Skip queue size check if it's not supported
+                        pass
+                except Exception as e:
+                    error_msg = str(e) if str(e) else "Unknown error (possibly qsize() not supported)"
+                    logger.warning(f"Prefetch queue error: {error_msg}")
+                    time.sleep(1)  # Brief pause, then retry
+                    try:
+                        prefetch_queue.put(article, timeout=QUEUE_TIMEOUT)
+                        counter += 1
+                    except Exception as e:
+                        error_msg = str(e) if str(e) else "Unknown error"
+                        logger.error(f"Prefetch queue still error after waiting: {error_msg}")
+            except Exception as e:
+                logger.warning(f"Error processing article in prefetch: {str(e)}")
+                continue
+                
+        logger.info(f"Prefetching complete, processed {counter} articles")
+    except Exception as e:
+        logger.error(f"Error in article prefetch process: {str(e)}")
+    finally:
+        # Signal end of articles with a None
+        try:
+            prefetch_queue.put(None, timeout=QUEUE_TIMEOUT)
+        except Exception as e:
+            logger.error(f"Failed to send prefetch completion signal: {str(e)}")
+
 def articles_without_disambiguation_or_redirections(
     file_path: str,
     num_workers: int,
-    queue,
+    article_queue,
     redirect_map: dict,
     max_articles: int,
+    prefetch_queue=None,
 ):
-    """Feed articles to workers with improved error handling and work balancing."""
+    """Feed articles to workers with improved error handling and work balancing.
+    
+    If prefetch_queue is provided, articles will be fetched from there instead of directly from the file."""
     # the reason we iterate over and process the Wikipedia dump file again is we don't want to keep everything in memory, especially for large dump files.
     pbar = None
     try:
@@ -938,16 +1045,46 @@ def articles_without_disambiguation_or_redirections(
         article_buffer = []
         buffer_size = min(num_workers * 3, 100)  # Buffer enough to distribute well, but not too much memory
         
-        for article in tarfile_loader(file_path):
+        # Choose article source - either prefetch queue or direct from file
+        if prefetch_queue:
+            logger.info("Using prefetched articles")
+            # Function to get articles from the prefetch queue
+            def get_articles():
+                while True:
+                    try:
+                        article = prefetch_queue.get(timeout=QUEUE_TIMEOUT)
+                        if article is None:  # End signal
+                            break
+                        yield article
+                    except Exception as e:
+                        error_msg = str(e) if str(e) else "Unknown queue error"
+                        logger.warning(f"Error getting from prefetch queue: {error_msg}")
+                        time.sleep(0.1)  # Short sleep to avoid spamming logs
+                        continue
+            
+            article_source = get_articles()
+        else:
+            logger.info("Reading articles directly from file")
+            # Filter articles from tarfile directly
+            def direct_articles():
+                for article in tarfile_loader(file_path):
+                    if is_disambiguation(article):
+                        continue
+                    url = url_to_entity_name(article["url"])
+                    if url not in redirect_map:
+                        continue
+                    yield article
+            
+            article_source = direct_articles()
+        
+        # Process articles from the chosen source
+        for article in article_source:
             try:
-                if is_disambiguation(article):
-                    continue
-                url = url_to_entity_name(article["url"])
-                if url not in redirect_map:
-                    continue
-                
-                # Estimate article complexity for better work distribution
-                complexity = estimate_article_complexity(article)
+                # Get complexity - either pre-calculated or calculate now
+                if '_complexity' in article:
+                    complexity = article['_complexity']
+                else:
+                    complexity = estimate_article_complexity(article)
                 
                 # Add to buffer
                 article_buffer.append((article, complexity))
@@ -974,20 +1111,20 @@ def articles_without_disambiguation_or_redirections(
                     for article_item, _ in distributed_buffer:
                         try:
                             # Use timeout to avoid indefinite blocking
-                            queue.put(article_item, timeout=QUEUE_TIMEOUT)
+                            article_queue.put(article_item, timeout=QUEUE_TIMEOUT)
                             pbar.update(1)
                             counter += 1
                             if max_articles > 0 and counter >= max_articles:
                                 break
-                        except queue.Full:
+                        except Exception as e:
                             logger.warning("Timeout putting article in queue: queue full")
                             # If we can't add to the queue, we'll slow down a bit and retry
                             time.sleep(1)
                             try:
-                                queue.put(article_item, timeout=QUEUE_TIMEOUT)
+                                article_queue.put(article_item, timeout=QUEUE_TIMEOUT)
                                 pbar.update(1)
                                 counter += 1
-                            except queue.Full:
+                            except Exception as e:
                                 logger.error("Failed to add article to queue even after retry")
                     
                     # Clear buffer after processing
@@ -1004,20 +1141,20 @@ def articles_without_disambiguation_or_redirections(
         # Process any remaining articles in buffer
         for article_item, _ in article_buffer:
             try:
-                queue.put(article_item, timeout=QUEUE_TIMEOUT)
+                article_queue.put(article_item, timeout=QUEUE_TIMEOUT)
                 pbar.update(1)
                 counter += 1
                 if max_articles > 0 and counter >= max_articles:
                     break
-            except queue.Full:
-                logger.warning("Queue full when processing remaining articles")
+            except Exception as e:
+                logger.warning(f"Queue full when processing remaining articles: {str(e)}")
                 time.sleep(1)  # Brief pause to let queue drain
                 try:
-                    queue.put(article_item, timeout=QUEUE_TIMEOUT)
+                    article_queue.put(article_item, timeout=QUEUE_TIMEOUT)
                     pbar.update(1)
                     counter += 1
-                except queue.Full:
-                    logger.error("Failed to add remaining article to queue even after retry")
+                except Exception as e:
+                    logger.error(f"Failed to add remaining article to queue even after retry: {str(e)}")
                 
     except Exception as e:
         logger.error(f"Error in article extraction: {str(e)}")
@@ -1026,9 +1163,9 @@ def articles_without_disambiguation_or_redirections(
         logger.info("Sending termination signals to workers")
         for _ in range(num_workers):
             try:
-                queue.put(None, timeout=QUEUE_TIMEOUT)  # signal end to all workers
-            except queue.Full:
-                logger.error("Failed to send termination signal to a worker")
+                article_queue.put(None, timeout=QUEUE_TIMEOUT)  # signal end to all workers
+            except Exception as e:
+                logger.error(f"Failed to send termination signal to a worker: {str(e)}")
         
         # Always close the progress bar
         if pbar:
@@ -1095,6 +1232,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Write batches in a separate process to avoid blocking the main processing loop.",
     )
+    arg_parser.add_argument(
+        "--output_queue_count",
+        type=int,
+        default=DEFAULT_OUTPUT_QUEUE_COUNT,
+        help=f"Number of output queues to use for distributing worker results. Default: {DEFAULT_OUTPUT_QUEUE_COUNT}",
+    )
+    arg_parser.add_argument(
+        "--prefetch_size",
+        type=int,
+        default=DEFAULT_PREFETCH_SIZE,
+        help=f"Number of articles to prefetch to optimize I/O. Default: {DEFAULT_PREFETCH_SIZE}",
+    )
 
     args = arg_parser.parse_args()
     if args.language == "en":
@@ -1159,9 +1308,20 @@ if __name__ == "__main__":
 
     # Use bounded queues with configurable sizes
     logger.info(f"Using queue size of {args.queue_size} and batch size of {args.batch_size}")
+    
+    # Create prefetch queue for article prefetching
+    prefetch_queue = Queue(maxsize=max(args.prefetch_size * 2, 500))
+    logger.info(f"Created prefetch queue with capacity for {prefetch_queue._maxsize} articles")
+    
+    # Create input/output/dead letter queues
     input_queue = Queue(maxsize=args.queue_size)
-    output_queue = Queue(maxsize=args.queue_size)
     dead_letter_queue = Queue(maxsize=args.queue_size)
+    
+    # Create multiple output queues for better parallelism
+    output_queues = []
+    for i in range(args.output_queue_count):
+        output_queues.append(Queue(maxsize=args.queue_size))
+    logger.info(f"Created {len(output_queues)} output queues for distributing worker output")
     
     # Set up batch queue if using parallel batch writing
     batch_queue = None
@@ -1170,6 +1330,19 @@ if __name__ == "__main__":
         logger.info("Using parallel batch writing")
     
     all_worker_processes = []
+    
+    # Create prefetch process
+    prefetch_process = Process(
+        target=prefetch_articles_process,
+        args=(
+            args.input_path,
+            prefetch_queue,
+            redirection_map,
+            args.max_articles,
+            args.prefetch_size,
+        )
+    )
+    logger.info(f"Created prefetch process with buffer size {args.prefetch_size}")
 
     # make parent directories
     pathlib.Path(os.path.dirname(args.output_path)).mkdir(parents=True, exist_ok=True)
@@ -1181,7 +1354,7 @@ if __name__ == "__main__":
                 target=process_articles,
                 args=(
                     input_queue,
-                    output_queue,
+                    output_queues,  # Pass the list of output queues
                     dead_letter_queue,
                     args.pack_to_tokens,
                     args.language,
@@ -1200,6 +1373,7 @@ if __name__ == "__main__":
             input_queue,
             redirection_map,
             args.max_articles,
+            prefetch_queue,  # Pass prefetch queue to use prefetched articles
         ),
     )
     
@@ -1238,11 +1412,19 @@ if __name__ == "__main__":
     DETAILED_LOG_INTERVAL = 300  # Detailed stats every 5 minutes
 
     try:
-        # Start all processes
+        # Start prefetch process first
+        logger.info("Starting prefetch process")
+        prefetch_process.start()
+        
+        # Give prefetch process a head start to fill the queue
+        time.sleep(2)
+        
+        # Start all other processes
         processes_to_start = all_worker_processes + [reader_process]
         if batch_writer:
             processes_to_start.append(batch_writer)
             
+        logger.info(f"Starting {len(processes_to_start)} processes ({len(all_worker_processes)} workers, 1 reader{', 1 batch writer' if batch_writer else ''})")
         for p in processes_to_start:
             p.start()
 
@@ -1283,14 +1465,51 @@ if __name__ == "__main__":
                     gc.collect()
                     last_gc_time = current_time
                 
+                # Check all output queues using a non-blocking approach
                 try:
-                    # Get block with timeout
-                    block = output_queue.get(timeout=QUEUE_TIMEOUT)
+                    # Create list of queues to check
+                    queues_to_check = output_queues[:]
+                    block = None
                     
+                    # Try to get a block from any non-empty queue
+                    for q in queues_to_check:
+                        try:
+                            # Use non-blocking get to check queue
+                            block = q.get_nowait()
+                            
+                            # Found a None signal (worker finished)
+                            if block is None:
+                                workers_finished += 1
+                                logger.info(f"Worker completed. {workers_finished}/{len(all_worker_processes)} workers finished")
+                                block = None  # Reset block so we loop again
+                                break
+                                
+                            # Found a real block, break the loop
+                            break
+                        except queue.Empty:
+                            # This queue is empty, try next one
+                            continue
+                    
+                    # If we didn't get a block from any queue, wait on the first queue
                     if block is None:
-                        workers_finished += 1
-                        logger.info(f"Worker completed. {workers_finished}/{len(all_worker_processes)} workers finished")
-                        continue
+                        # Use a shorter timeout since we're checking multiple queues
+                        try:
+                            block = output_queues[0].get(timeout=QUEUE_TIMEOUT/len(output_queues))
+                            if block is None:
+                                workers_finished += 1
+                                logger.info(f"Worker completed. {workers_finished}/{len(all_worker_processes)} workers finished")
+                                continue
+                        except Exception as e:
+                            # No blocks available right now or other error
+                            # Check if all workers are done
+                            alive_workers = sum(1 for p in all_worker_processes if p.is_alive())
+                            if alive_workers == 0 and workers_finished < len(all_worker_processes):
+                                logger.warning(f"All workers appear to be dead but only {workers_finished}/{len(all_worker_processes)} reported completion")
+                                # Force completion since workers are all done
+                                workers_finished = len(all_worker_processes)
+                                break
+                            # Otherwise continue checking
+                            continue
                         
                     # Process the block
                     if block.block_type == "text":
@@ -1385,25 +1604,27 @@ if __name__ == "__main__":
             logger.info("Sending termination signal to batch writer")
             try:
                 batch_queue.put(None, timeout=QUEUE_TIMEOUT)
-            except queue.Full:
-                logger.error("Failed to send termination signal to batch writer")
+            except Exception as e:
+                error_msg = str(e) if str(e) else "Unknown error"
+                logger.error(f"Failed to send termination signal to batch writer: {error_msg}")
         
         # Ensure processes are terminated properly
         logger.info("Cleaning up processes")
-        processes_to_cleanup = all_worker_processes + [reader_process]
+        processes_to_cleanup = all_worker_processes + [reader_process, prefetch_process]
         if batch_writer:
             processes_to_cleanup.append(batch_writer)
             
         for p in processes_to_cleanup:
-            if p.is_alive():
+            if p and p.is_alive():
                 p.terminate()
                 logger.info(f"Terminated process {p.pid}")
         
         # Wait for processes to complete with timeout
         for p in processes_to_cleanup:
-            p.join(timeout=10)
-            if p.is_alive():
-                logger.warning(f"Process {p.pid} did not terminate gracefully")
+            if p:
+                p.join(timeout=10)
+                if p.is_alive():
+                    logger.warning(f"Process {p.pid} did not terminate gracefully")
                 
         # We don't have all blocks in memory anymore, so we'll have to concatenate the part files
         logger.info(f"Processing complete with {total_blocks} total blocks")
