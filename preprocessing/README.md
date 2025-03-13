@@ -1,4 +1,6 @@
 Here's an ASCII art diagram showing the multi-process architecture of the system:
+
+```
                                                                                
                                    +-------------------+
                                    |                   |
@@ -54,6 +56,7 @@ Here's an ASCII art diagram showing the multi-process architecture of the system
                           | (.part files)|         | Process     |
                           |              |         |             |
                           +--------------+         +-------------+
+```
 
   Key Components
 

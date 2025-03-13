@@ -21,6 +21,8 @@ import json
 
 from preprocessing.block import Block
 
+import pdb
+
 sys.path.insert(0, "./")
 from pipelines.utils import get_logger
 from preprocessing.utils import (
@@ -579,6 +581,7 @@ def load_checkpoint(checkpoint_file):
             checkpoint_data = json.load(f)
         
         processed_count = checkpoint_data.get("processed_count", 0)
+        pdb.set_trace()
         processed_articles = set(checkpoint_data.get("processed_articles", []))
         
         logger.info(f"Resuming from checkpoint: {processed_count} articles processed")
